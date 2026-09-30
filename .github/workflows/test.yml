@@ -1,0 +1,29 @@
+name: test
+
+on: [push]
+
+permissions: read-all
+
+jobs:
+  build:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: code
+        uses: actions/checkout@v4
+
+      - name: go
+        uses: ndx-technologies/gh-setup-go@v1
+        id: setup-go
+        with:
+          go-version: "1.27.0"
+
+      - name: test
+        run: |
+          go get -v -t ./...
+          go test -short -cover -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: save go mod cache
+        run: gh-setup-go -save-cache -key "${{ steps.setup-go.outputs.key }}"
