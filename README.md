@@ -1,1 +1,1 @@
-Go Apple API Client
+Apple API Go Client
