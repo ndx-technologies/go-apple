@@ -4,14 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -45,11 +42,15 @@ func (s APNClientConfig) WithDefaults() APNClientConfig {
 
 type NotificationID string
 
+func (s NotificationID) IsZero() bool { return s == "" }
+
+func (s NotificationID) String() string { return string(s) }
+
 // CollapseID replaces a notification already on the device with the same id.
 type CollapseID string
 
-type Headers struct {
-	ID         NotificationID // echoed back by the client on tap; empty, APNs assigns one
+type NotificationDetails struct {
+	ID         NotificationID
 	PushType   PushType
 	Priority   Priority
 	CollapseID CollapseID
@@ -67,106 +68,95 @@ type APNClient struct {
 	}
 }
 
-type reasonBody struct {
-	Reason    Reason `json:"reason"`
-	Timestamp int64  `json:"timestamp"`
-}
-
 // Token is a device token, the address of one app installation on one device.
 // https://developer.apple.com/documentation/usernotifications/registering-your-app-with-apns
 type Token string
 
 func (s Token) String() string { return string(s) }
 
-// A non-nil error means the request never reached APNs or the response could not
-// be read. A nil error with a non-200 Response.Status is a normal outcome: read
-// Response.TokenIsInvalid and Response.Retryable to decide what to do with it.
-//
-// Nothing is retried here, including after APNs rejects the provider token and it
-// is invalidated. The next attempt is the caller's to make.
-func (s APNClient) Send(ctx context.Context, token Token, payload any, h Headers) (resp *Response, err error) {
-	ctx, span := otel.Tracer("apns").Start(ctx, "Send", trace.WithSpanKind(trace.SpanKindClient))
-	defer span.End()
-	defer func() {
-		if err != nil {
-			span.SetStatus(codes.Error, err.Error())
-			span.RecordError(err)
-		}
-	}()
-
-	if h.PushType == "" {
-		h.PushType = PushTypeAlert
+// Send notification to device holding token.
+// Payload must be a struct with APS `json:"aps"` field.
+func (s APNClient) Send(ctx context.Context, token Token, payload any, details NotificationDetails) error {
+	// APNs generates id if missing. however reject immediately if client forget to include it to prevent drift.
+	if details.ID.IsZero() {
+		return errors.New("missing notification id")
 	}
-	if len(h.CollapseID) > MaxCollapseIDSize {
-		return nil, ErrCollapseIDTooLong{Size: len(h.CollapseID), Max: MaxCollapseIDSize}
+
+	if details.PushType == "" {
+		details.PushType = PushTypeAlert
+	}
+
+	if len(details.CollapseID) > MaxCollapseIDSize {
+		return ErrCollapseIDTooLong{Size: len(details.CollapseID), Max: MaxCollapseIDSize}
 	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(body) > MaxPayloadSize {
-		return nil, ErrPayloadTooLarge{Size: len(body), Max: MaxPayloadSize}
+		return ErrPayloadTooLarge{Size: len(body), Max: MaxPayloadSize}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.Config.BaseURL+"/3/device/"+token.String(), bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	providerToken, err := s.ProviderToken.GetJWT("")
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	req.Header.Set("authorization", "bearer "+providerToken)
 	req.Header.Set("apns-topic", s.Config.BundleID)
-	req.Header.Set("apns-push-type", string(h.PushType))
-	if h.Priority != 0 {
-		req.Header.Set("apns-priority", strconv.Itoa(int(h.Priority)))
+	req.Header.Set("apns-push-type", string(details.PushType))
+	if details.Priority != 0 {
+		req.Header.Set("apns-priority", strconv.Itoa(int(details.Priority)))
 	}
-	if h.ID != "" {
-		req.Header.Set("apns-id", string(h.ID))
+	if details.ID != "" {
+		req.Header.Set("apns-id", string(details.ID))
 	}
-	if h.CollapseID != "" {
-		req.Header.Set("apns-collapse-id", string(h.CollapseID))
+	if details.CollapseID != "" {
+		req.Header.Set("apns-collapse-id", string(details.CollapseID))
 	}
-	if !h.Expiration.IsZero() {
-		req.Header.Set("apns-expiration", strconv.FormatInt(h.Expiration.Unix(), 10))
+	if !details.Expiration.IsZero() {
+		req.Header.Set("apns-expiration", strconv.FormatInt(details.Expiration.Unix(), 10))
 	}
-
-	span.SetAttributes(attribute.String("apns.push_type", string(h.PushType)))
 
 	httpResp, err := s.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer httpResp.Body.Close()
 
 	id := NotificationID(httpResp.Header.Get("apns-id"))
-	if id == "" {
-		id = h.ID
+	if id != details.ID {
+		return &ErrUnexpectedNotificationID{ID: id, ExpectedID: details.ID}
 	}
 
-	resp = &Response{ID: id, Status: httpResp.StatusCode}
+	if httpResp.StatusCode != http.StatusOK {
+		var e struct {
+			Reason Reason `json:"reason"`
+		}
+		if err := json.UnmarshalRead(httpResp.Body, &e); err != nil {
+			slog.ErrorContext(ctx, "cannot decode error response", "error", err)
+		}
 
-	if resp.IsOK() {
-		return resp, nil
+		resp := &ErrResponse{ID: id, Status: httpResp.StatusCode, Reason: e.Reason}
+
+		if resp.NeedsProviderTokenRefresh() {
+			s.ProviderToken.Invalidate()
+		}
+
+		return resp
 	}
 
-	var e reasonBody
-	if json.UnmarshalRead(httpResp.Body, &e) == nil {
-		resp.Reason = e.Reason
-	}
+	return nil
+}
 
-	span.SetAttributes(
-		attribute.Int("http.response.status_code", resp.Status),
-		attribute.String("apns.reason", string(resp.Reason)),
-	)
+type ErrUnexpectedNotificationID struct{ ID, ExpectedID NotificationID }
 
-	if resp.NeedsProviderTokenRefresh() {
-		s.ProviderToken.Invalidate()
-	}
-
-	return resp, nil
+func (s *ErrUnexpectedNotificationID) Error() string {
+	return "unexpected notification id: " + s.ID.String() + " != " + s.ExpectedID.String() + " (exp)"
 }

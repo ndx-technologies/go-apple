@@ -2,6 +2,7 @@ package apns
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -44,17 +45,23 @@ const (
 	ReasonShutdown                    Reason = "Shutdown"
 )
 
-type Response struct {
+type ErrResponse struct {
 	ID     NotificationID
 	Status int
 	Reason Reason
 }
 
-func (s Response) IsOK() bool { return s.Status == http.StatusOK }
+func (s ErrResponse) Error() string {
+	msg := "apns: " + strconv.Itoa(s.Status) + " " + http.StatusText(s.Status)
+	if s.Reason != "" {
+		msg += ": " + string(s.Reason)
+	}
+	return msg
+}
 
 // TokenIsInvalid reports that the device token should be deleted rather than retried.
 // These are the responses Apple says not to repeat.
-func (s Response) TokenIsInvalid() bool {
+func (s ErrResponse) TokenIsInvalid() bool {
 	switch s.Reason {
 	case ReasonBadDeviceToken,
 		ReasonDeviceTokenNotForTopic,
@@ -70,7 +77,7 @@ func (s Response) TokenIsInvalid() bool {
 // NeedsProviderTokenRefresh reports that the originator token was rejected and
 // should be re-signed. A stale token certainly needs a new one, and one whose
 // signature cannot be verified should not be trusted from cache either.
-func (s Response) NeedsProviderTokenRefresh() bool {
+func (s ErrResponse) NeedsProviderTokenRefresh() bool {
 	return s.Status == http.StatusForbidden &&
 		(s.Reason == ReasonExpiredProviderToken || s.Reason == ReasonInvalidProviderToken)
 }
@@ -82,7 +89,7 @@ func (s Response) NeedsProviderTokenRefresh() bool {
 // The test is deliberately fail-safe: every 403 that is not the routine
 // stale-token case counts, including a reason we do not recognise or could not
 // parse, so a new reason from Apple cannot make a real problem disappear quietly.
-func (s Response) NeedsOperatorAttention() bool {
+func (s ErrResponse) NeedsOperatorAttention() bool {
 	if s.Status != http.StatusForbidden {
 		return false
 	}
@@ -96,7 +103,7 @@ func (s Response) NeedsOperatorAttention() bool {
 //
 // 4xx responses generally mean the request itself is wrong and must be fixed
 // rather than repeated.
-func (s Response) Retryable(config APNClientConfig) (after time.Duration, ok bool) {
+func (s ErrResponse) Retryable(config APNClientConfig) (after time.Duration, ok bool) {
 	switch s.Status {
 	case http.StatusInternalServerError, http.StatusServiceUnavailable:
 		return config.RetryAfter5xx, true

@@ -21,11 +21,10 @@ import (
 )
 
 const (
-	testToken    = apns.Token("00fc13adff785122b4ad28809a3420982341241421348097878e577c991de8f0")
-	testBundleID = "com.example.app"
-
-	// Inside APNs' 20 minute to 1 hour window for provider token lifetime.
-	providerTokenTTL = time.Minute * 50
+	testToken          = apns.Token("00fc13adff785122b4ad28809a3420982341241421348097878e577c991de8f0")
+	testBundleID       = "com.example.app"
+	testNotificationID = apns.NotificationID("2b0b3a1e-8f4c-4d5e-9a71-0c3b6d2e5f18")
+	providerTokenTTL   = time.Minute * 50 // Inside APNs' 20 minute to 1 hour window for provider token lifetime.
 )
 
 // "Try once, do not store": APNs stores the notification otherwise and may deliver it much later.
@@ -80,6 +79,9 @@ func (s *fakeAPNS) handler(t *testing.T) http.HandlerFunc {
 
 		if s.apnsID != "" {
 			w.Header().Set("apns-id", s.apnsID)
+		} else if id := r.Header.Get("apns-id"); id != "" {
+			// A real APNs echoes the apns-id the client sent.
+			w.Header().Set("apns-id", id)
 		}
 		w.WriteHeader(s.status)
 		if s.reason != "" {
@@ -99,6 +101,20 @@ type mockProviderToken struct {
 func (m *mockProviderToken) GetJWT(string) (string, error) { return m.token, m.err }
 
 func (m *mockProviderToken) Invalidate() { m.invalidated++ }
+
+// refreshingProvider counts signing and invalidation, so a rejection followed by
+// a re-sign and an accepted retry is observable.
+type refreshingProvider struct {
+	signed      int
+	invalidated int
+}
+
+func (m *refreshingProvider) GetJWT(string) (string, error) {
+	m.signed++
+	return fmt.Sprintf("provider-token-%d", m.signed), nil
+}
+
+func (m *refreshingProvider) Invalidate() { m.invalidated++ }
 
 // testPrivateKeyPEM builds a real P8 key rather than embedding one, so the test
 // exercises the same parsing path as a key downloaded from Apple.
@@ -168,10 +184,10 @@ func newClient(t *testing.T, server *fakeAPNS) (apns.APNClient, *fakeAPNS) {
 func TestClientSendRequestShape(t *testing.T) {
 	client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 
-	_, err := client.Send(t.Context(), testToken, testPayload{
+	err := client.Send(t.Context(), testToken, testPayload{
 		APS:  apns.APS{Alert: &apns.Alert{Body: "hi"}},
 		Data: customEnvelope{Type: "reminder"},
-	}, apns.Headers{
+	}, apns.NotificationDetails{
 		ID:         "2b0b3a1e-8f4c-4d5e-9a71-0c3b6d2e5f18",
 		PushType:   apns.PushTypeAlert,
 		Priority:   apns.PriorityImmediate,
@@ -229,41 +245,30 @@ func TestClientSendRequestShape(t *testing.T) {
 }
 
 func TestClientSendAccepted(t *testing.T) {
-	t.Run("when accepted, then ok", func(t *testing.T) {
+	t.Run("when accepted, then no error", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusOK})
 
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{})
+		err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !resp.IsOK() {
-			t.Error(resp)
+	})
+
+	t.Run("when APNs echoes the id, then no error", func(t *testing.T) {
+		client, _ := newClient(t, &fakeAPNS{status: http.StatusOK, apnsID: string(testNotificationID)})
+
+		err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID})
+		if err != nil {
+			t.Fatal(err)
 		}
 	})
 
-	t.Run("when APNs assigns an id, then it is returned", func(t *testing.T) {
+	t.Run("when APNs echoes a different id, then error", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusOK, apnsID: "eabeae54-14a8-11e5-b60b-1697f925ec7b"})
 
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.ID != "eabeae54-14a8-11e5-b60b-1697f925ec7b" {
-			t.Error(resp.ID)
-		}
-	})
-
-	t.Run("when APNs echoes nothing, then the request id is kept", func(t *testing.T) {
-		client, _ := newClient(t, &fakeAPNS{status: http.StatusOK})
-
-		const id = "2b0b3a1e-8f4c-4d5e-9a71-0c3b6d2e5f18"
-
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{ID: id})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.ID != id {
-			t.Error(resp.ID)
+		var unexpected *apns.ErrUnexpectedNotificationID
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &unexpected) {
+			t.Error(err)
 		}
 	})
 }
@@ -272,7 +277,7 @@ func TestClientSendDefaults(t *testing.T) {
 	t.Run("when push type and priority are unset, then defaults are used", func(t *testing.T) {
 		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err != nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -291,7 +296,7 @@ func TestClientSendExpiration(t *testing.T) {
 		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 
 		at := time.Unix(1790000000, 0)
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{Expiration: at}); err != nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID, Expiration: at}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -303,7 +308,7 @@ func TestClientSendExpiration(t *testing.T) {
 	t.Run("when now or never, then zero is sent", func(t *testing.T) {
 		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{Expiration: expirationImmediate}); err != nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID, Expiration: expirationImmediate}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -315,7 +320,7 @@ func TestClientSendExpiration(t *testing.T) {
 	t.Run("when unset, then the header is absent", func(t *testing.T) {
 		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err != nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -326,13 +331,13 @@ func TestClientSendExpiration(t *testing.T) {
 }
 
 func TestClientSendRejections(t *testing.T) {
-	// A rejection is an answer, not a transport failure, so it is reported in the
-	// response rather than as an error.
+	// A rejection is an answer, not a transport failure, so it comes back as an
+	// ErrResponse carrying APNs' status and reason.
 	t.Run("when the device is gone, then the reason is parsed", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusGone, reason: "Unregistered"})
 
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{})
-		if err != nil {
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
 			t.Fatal(err)
 		}
 		if resp.Status != http.StatusGone {
@@ -346,19 +351,23 @@ func TestClientSendRejections(t *testing.T) {
 		}
 	})
 
-	t.Run("when rejected, then no error is returned", func(t *testing.T) {
+	t.Run("when rejected, then the rejection is an error", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusBadRequest, reason: "BadDeviceToken"})
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err != nil {
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
 			t.Fatal(err)
+		}
+		if resp.Reason != apns.ReasonBadDeviceToken {
+			t.Error(resp.Reason)
 		}
 	})
 
 	t.Run("when the body is empty, then the status still stands", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusServiceUnavailable})
 
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{})
-		if err != nil {
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
 			t.Fatal(err)
 		}
 		if resp.Reason != "" {
@@ -370,10 +379,9 @@ func TestClientSendRejections(t *testing.T) {
 	})
 
 	t.Run("when the body is not json, then the status still stands", func(t *testing.T) {
-		server := &fakeAPNS{status: http.StatusBadRequest}
-
 		httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(server.status)
+			w.Header().Set("apns-id", r.Header.Get("apns-id"))
+			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, "not json")
 		}))
 		t.Cleanup(httpServer.Close)
@@ -390,8 +398,8 @@ func TestClientSendRejections(t *testing.T) {
 			HTTPClient:    http.DefaultClient,
 		}
 
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{})
-		if err != nil {
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
 			t.Fatal(err)
 		}
 		if resp.Status != http.StatusBadRequest {
@@ -404,8 +412,8 @@ func TestClientSendRejections(t *testing.T) {
 	t.Run("when the key does not match the environment, then it is not a bad token", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusForbidden, reason: "BadEnvironmentKeyInToken"})
 
-		resp, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{})
-		if err != nil {
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
 			t.Fatal(err)
 		}
 		if resp.Reason != apns.ReasonBadEnvironmentKeyIDInToken {
@@ -442,11 +450,64 @@ func TestClientSendRejections(t *testing.T) {
 			HTTPClient:    http.DefaultClient,
 		}
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err != nil {
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
 			t.Fatal(err)
+		}
+		if resp.Reason != apns.ReasonExpiredProviderToken {
+			t.Error(resp.Reason)
 		}
 		if provider.invalidated != 1 {
 			t.Error(provider.invalidated)
+		}
+	})
+
+	// Invalidate drops the cached token, so the caller's next attempt is signed
+	// with a fresh one and APNs accepts it. Send itself never retries.
+	t.Run("when the originator token expired, then the next attempt is re-signed", func(t *testing.T) {
+		attempts := 0
+		httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts++
+			w.Header().Set("apns-id", r.Header.Get("apns-id"))
+			if attempts == 1 {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"reason":"ExpiredProviderToken"}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(httpServer.Close)
+
+		provider := &refreshingProvider{}
+
+		config := apns.APNClientConfig{
+			BaseURL:  httpServer.URL,
+			BundleID: testBundleID,
+		}
+		config = config.WithDefaults()
+
+		client := apns.APNClient{
+			Config:        config,
+			ProviderToken: provider,
+			HTTPClient:    http.DefaultClient,
+		}
+
+		var resp *apns.ErrResponse
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &resp) {
+			t.Fatal(err)
+		}
+		if resp.Reason != apns.ReasonExpiredProviderToken {
+			t.Error(resp.Reason)
+		}
+		if provider.invalidated != 1 {
+			t.Errorf("token was not invalidated: %d", provider.invalidated)
+		}
+
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); err != nil {
+			t.Fatal(err)
+		}
+		if provider.signed != 2 {
+			t.Errorf("token was not re-signed: %d", provider.signed)
 		}
 	})
 
@@ -470,7 +531,7 @@ func TestClientSendRejections(t *testing.T) {
 			HTTPClient:    http.DefaultClient,
 		}
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err != nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); err != nil {
 			t.Fatal(err)
 		}
 		if provider.invalidated != 0 {
@@ -480,13 +541,24 @@ func TestClientSendRejections(t *testing.T) {
 }
 
 func TestClientSendErrors(t *testing.T) {
+	t.Run("when the notification id is missing, then error before sending", func(t *testing.T) {
+		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
+
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{}); err == nil {
+			t.Fatal("expected an error")
+		}
+		if server.request.path != "" {
+			t.Error("the request was sent anyway")
+		}
+	})
+
 	t.Run("when the payload is too large, then error before sending", func(t *testing.T) {
 		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 
 		payload := testPayload{APS: apns.APS{Alert: &apns.Alert{Body: strings.Repeat("a", apns.MaxPayloadSize)}}}
 
 		var tooLarge apns.ErrPayloadTooLarge
-		if _, err := client.Send(t.Context(), testToken, payload, apns.Headers{}); !errors.As(err, &tooLarge) {
+		if err := client.Send(t.Context(), testToken, payload, apns.NotificationDetails{ID: testNotificationID}); !errors.As(err, &tooLarge) {
 			t.Error(err)
 		}
 		if server.request.path != "" {
@@ -497,10 +569,10 @@ func TestClientSendErrors(t *testing.T) {
 	t.Run("when the collapse id is too long, then error", func(t *testing.T) {
 		client, _ := newClient(t, &fakeAPNS{status: http.StatusOK})
 
-		headers := apns.Headers{CollapseID: apns.CollapseID(strings.Repeat("a", apns.MaxCollapseIDSize+1))}
+		headers := apns.NotificationDetails{ID: testNotificationID, CollapseID: apns.CollapseID(strings.Repeat("a", apns.MaxCollapseIDSize+1))}
 
 		var tooLong apns.ErrCollapseIDTooLong
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, headers); !errors.As(err, &tooLong) {
+		if err := client.Send(t.Context(), testToken, testPayload{}, headers); !errors.As(err, &tooLong) {
 			t.Error(err)
 		}
 	})
@@ -509,7 +581,7 @@ func TestClientSendErrors(t *testing.T) {
 		client, server := newClient(t, &fakeAPNS{status: http.StatusOK})
 		client.ProviderToken = &mockProviderToken{err: errors.New("no key")}
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err == nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); err == nil {
 			t.Fatal("expected an error")
 		}
 		if server.request.path != "" {
@@ -534,7 +606,7 @@ func TestClientSendErrors(t *testing.T) {
 			HTTPClient:    http.DefaultClient,
 		}
 
-		if _, err := client.Send(t.Context(), testToken, testPayload{}, apns.Headers{}); err == nil {
+		if err := client.Send(t.Context(), testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
@@ -545,7 +617,7 @@ func TestClientSendErrors(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		if _, err := client.Send(ctx, testToken, testPayload{}, apns.Headers{}); !errors.Is(err, context.Canceled) {
+		if err := client.Send(ctx, testToken, testPayload{}, apns.NotificationDetails{ID: testNotificationID}); !errors.Is(err, context.Canceled) {
 			t.Error(err)
 		}
 	})

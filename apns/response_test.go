@@ -2,6 +2,7 @@ package apns_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/ndx-technologies/go-apple/apns"
@@ -12,7 +13,7 @@ import (
 
 func TestResponseTokenIsInvalid(t *testing.T) {
 	t.Run("when the token is gone, then delete it", func(t *testing.T) {
-		for _, r := range []apns.Response{
+		for _, r := range []apns.ErrResponse{
 			{Status: http.StatusGone, Reason: apns.ReasonUnregistered},
 			{Status: http.StatusGone, Reason: apns.ReasonExpiredToken},
 			{Status: http.StatusBadRequest, Reason: apns.ReasonBadDeviceToken},
@@ -26,7 +27,7 @@ func TestResponseTokenIsInvalid(t *testing.T) {
 	})
 
 	t.Run("when the request was fine, then keep the token", func(t *testing.T) {
-		for _, r := range []apns.Response{
+		for _, r := range []apns.ErrResponse{
 			{Status: http.StatusOK},
 			{Status: http.StatusBadRequest, Reason: apns.ReasonBadTopic},
 			{Status: http.StatusBadRequest, Reason: apns.ReasonPayloadEmpty},
@@ -44,7 +45,7 @@ func TestResponseTokenIsInvalid(t *testing.T) {
 func TestResponseNeedsProviderTokenRefresh(t *testing.T) {
 	t.Run("when the originator token is rejected, then refresh", func(t *testing.T) {
 		for _, reason := range []apns.Reason{apns.ReasonExpiredProviderToken, apns.ReasonInvalidProviderToken} {
-			r := apns.Response{Status: http.StatusForbidden, Reason: reason}
+			r := apns.ErrResponse{Status: http.StatusForbidden, Reason: reason}
 			if !r.NeedsProviderTokenRefresh() {
 				t.Error(reason)
 			}
@@ -52,14 +53,14 @@ func TestResponseNeedsProviderTokenRefresh(t *testing.T) {
 	})
 
 	t.Run("when the token is merely forbidden, then do not refresh", func(t *testing.T) {
-		r := apns.Response{Status: http.StatusForbidden, Reason: apns.ReasonForbidden}
+		r := apns.ErrResponse{Status: http.StatusForbidden, Reason: apns.ReasonForbidden}
 		if r.NeedsProviderTokenRefresh() {
 			t.Error(r)
 		}
 	})
 
 	t.Run("when the status is not forbidden, then do not refresh", func(t *testing.T) {
-		r := apns.Response{Status: http.StatusBadRequest, Reason: apns.ReasonExpiredProviderToken}
+		r := apns.ErrResponse{Status: http.StatusBadRequest, Reason: apns.ReasonExpiredProviderToken}
 		if r.NeedsProviderTokenRefresh() {
 			t.Error(r)
 		}
@@ -82,7 +83,7 @@ func TestResponseNeedsOperatorAttention(t *testing.T) {
 			apns.ReasonMissingTopic,
 			apns.ReasonTopicDisallowed,
 		} {
-			r := apns.Response{Status: http.StatusForbidden, Reason: reason}
+			r := apns.ErrResponse{Status: http.StatusForbidden, Reason: reason}
 			if !r.NeedsOperatorAttention() {
 				t.Error(reason)
 			}
@@ -93,7 +94,7 @@ func TestResponseNeedsOperatorAttention(t *testing.T) {
 	// could not parse, must not be able to hide a real problem.
 	t.Run("when the reason is unknown or missing, then a human has to look", func(t *testing.T) {
 		for _, reason := range []apns.Reason{"", "SomeFutureReason", apns.ReasonBadPriority} {
-			r := apns.Response{Status: http.StatusForbidden, Reason: reason}
+			r := apns.ErrResponse{Status: http.StatusForbidden, Reason: reason}
 			if !r.NeedsOperatorAttention() {
 				t.Error(reason)
 			}
@@ -101,7 +102,7 @@ func TestResponseNeedsOperatorAttention(t *testing.T) {
 	})
 
 	t.Run("when the fault is a gone device, then no human is needed", func(t *testing.T) {
-		for _, r := range []apns.Response{
+		for _, r := range []apns.ErrResponse{
 			{Status: http.StatusOK},
 			{Status: http.StatusGone, Reason: apns.ReasonUnregistered},
 			{Status: http.StatusBadRequest, Reason: apns.ReasonBadDeviceToken},
@@ -116,7 +117,7 @@ func TestResponseNeedsOperatorAttention(t *testing.T) {
 
 	// A stale token is normal housekeeping and must not page anyone.
 	t.Run("when the token needs re-signing, then refresh handles it", func(t *testing.T) {
-		r := apns.Response{Status: http.StatusForbidden, Reason: apns.ReasonExpiredProviderToken}
+		r := apns.ErrResponse{Status: http.StatusForbidden, Reason: apns.ReasonExpiredProviderToken}
 		if !r.NeedsProviderTokenRefresh() {
 			t.Error("expected a refresh")
 		}
@@ -132,7 +133,7 @@ func TestResponseRetryable(t *testing.T) {
 
 	t.Run("when the server failed, then retry after the configured delay", func(t *testing.T) {
 		for _, status := range []int{http.StatusInternalServerError, http.StatusServiceUnavailable} {
-			after, ok := apns.Response{Status: status}.Retryable(config)
+			after, ok := apns.ErrResponse{Status: status}.Retryable(config)
 			if !ok {
 				t.Errorf("expected retryable: %d", status)
 			}
@@ -143,7 +144,7 @@ func TestResponseRetryable(t *testing.T) {
 	})
 
 	t.Run("when rate limited, then retry after the configured delay", func(t *testing.T) {
-		after, ok := apns.Response{Status: http.StatusTooManyRequests, Reason: apns.ReasonTooManyRequests}.Retryable(config)
+		after, ok := apns.ErrResponse{Status: http.StatusTooManyRequests, Reason: apns.ReasonTooManyRequests}.Retryable(config)
 		if !ok {
 			t.Fatal("expected retryable")
 		}
@@ -153,7 +154,7 @@ func TestResponseRetryable(t *testing.T) {
 	})
 
 	t.Run("when the token was updated too often, then wait before updating it again", func(t *testing.T) {
-		after, ok := apns.Response{Status: http.StatusTooManyRequests, Reason: apns.ReasonTooManyProviderTokenUpdates}.Retryable(config)
+		after, ok := apns.ErrResponse{Status: http.StatusTooManyRequests, Reason: apns.ReasonTooManyProviderTokenUpdates}.Retryable(config)
 		if !ok {
 			t.Fatal("expected retryable")
 		}
@@ -163,7 +164,7 @@ func TestResponseRetryable(t *testing.T) {
 	})
 
 	t.Run("when the originator token is stale, then retry immediately after refreshing", func(t *testing.T) {
-		after, ok := apns.Response{Status: http.StatusForbidden, Reason: apns.ReasonExpiredProviderToken}.Retryable(config)
+		after, ok := apns.ErrResponse{Status: http.StatusForbidden, Reason: apns.ReasonExpiredProviderToken}.Retryable(config)
 		if !ok {
 			t.Fatal("expected retryable")
 		}
@@ -175,13 +176,13 @@ func TestResponseRetryable(t *testing.T) {
 	// Re-signing a key that Apple does not recognise produces the same bad token,
 	// so a retry only adds 4xx errors, which is what makes APNs close connections.
 	t.Run("when the signature cannot be verified, then do not retry", func(t *testing.T) {
-		if _, ok := (apns.Response{Status: http.StatusForbidden, Reason: apns.ReasonInvalidProviderToken}).Retryable(config); ok {
+		if _, ok := (apns.ErrResponse{Status: http.StatusForbidden, Reason: apns.ReasonInvalidProviderToken}).Retryable(config); ok {
 			t.Error("expected no retry")
 		}
 	})
 
 	t.Run("when the device token is dead, then do not retry", func(t *testing.T) {
-		for _, r := range []apns.Response{
+		for _, r := range []apns.ErrResponse{
 			{Status: http.StatusGone, Reason: apns.ReasonUnregistered},
 			{Status: http.StatusBadRequest, Reason: apns.ReasonBadDeviceToken},
 			{Status: http.StatusBadRequest, Reason: apns.ReasonDeviceTokenNotForTopic},
@@ -193,7 +194,7 @@ func TestResponseRetryable(t *testing.T) {
 	})
 
 	t.Run("when the request is wrong, then do not retry", func(t *testing.T) {
-		for _, r := range []apns.Response{
+		for _, r := range []apns.ErrResponse{
 			{Status: http.StatusOK},
 			{Status: http.StatusForbidden, Reason: apns.ReasonForbidden},
 			{Status: http.StatusRequestEntityTooLarge, Reason: apns.ReasonPayloadTooLarge},
@@ -207,16 +208,18 @@ func TestResponseRetryable(t *testing.T) {
 	})
 }
 
-func TestResponseIsOK(t *testing.T) {
-	t.Run("when status is 200, then ok", func(t *testing.T) {
-		if !(apns.Response{Status: http.StatusOK}).IsOK() {
-			t.Error("expected ok")
+func TestErrResponseError(t *testing.T) {
+	t.Run("when the reason is known, then both status and reason are in the message", func(t *testing.T) {
+		e := apns.ErrResponse{ID: testNotificationID, Status: http.StatusGone, Reason: apns.ReasonUnregistered}
+		if msg := e.Error(); !strings.Contains(msg, "410") || !strings.Contains(msg, "Unregistered") {
+			t.Error(msg)
 		}
 	})
 
-	t.Run("when status is not 200, then not ok", func(t *testing.T) {
-		if (apns.Response{Status: http.StatusGone}).IsOK() {
-			t.Error("expected not ok")
+	t.Run("when the reason is missing, then the status still stands", func(t *testing.T) {
+		e := apns.ErrResponse{Status: http.StatusServiceUnavailable}
+		if msg := e.Error(); !strings.Contains(msg, "503") {
+			t.Error(msg)
 		}
 	})
 }

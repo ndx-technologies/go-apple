@@ -19,6 +19,7 @@ package apns_test
 // missing is a device, and the answer should be 400 BadDeviceToken.
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -125,11 +126,13 @@ func TestIntegrationSandboxRejectsUnknownToken(t *testing.T) {
 
 	client := integrationClient(t, apns.SandboxBaseURL)
 
-	resp, err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.Headers{
+	var resp *apns.ErrResponse
+	err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.NotificationDetails{
+		ID:       testNotificationID,
 		PushType: apns.PushTypeAlert,
 	})
-	if err != nil {
-		t.Fatalf("the request did not complete: %s", err)
+	if !errors.As(err, &resp) {
+		t.Fatalf("expected a rejection: %s", err)
 	}
 
 	// Anything other than BadDeviceToken means the key, the topic, the token, or
@@ -140,7 +143,7 @@ func TestIntegrationSandboxRejectsUnknownToken(t *testing.T) {
 	if resp.Reason != apns.ReasonBadDeviceToken {
 		t.Errorf("unexpected reason: %s", resp.Reason)
 	}
-	if resp.ID == "" {
+	if resp.ID.IsZero() {
 		t.Error("APNs did not return an apns-id")
 	}
 }
@@ -152,11 +155,13 @@ func TestIntegrationProductionRejectsUnknownToken(t *testing.T) {
 
 	client := integrationClient(t, apns.ProductionBaseURL)
 
-	resp, err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.Headers{
+	var resp *apns.ErrResponse
+	err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.NotificationDetails{
+		ID:       testNotificationID,
 		PushType: apns.PushTypeAlert,
 	})
-	if err != nil {
-		t.Fatalf("the request did not complete: %s", err)
+	if !errors.As(err, &resp) {
+		t.Fatalf("expected a rejection: %s", err)
 	}
 
 	if resp.Status != http.StatusBadRequest {
@@ -185,20 +190,17 @@ func TestIntegrationSandboxDelivers(t *testing.T) {
 	// No expiry, so APNs stores the notification and retries if the device is not
 	// reachable this instant. An immediate expiry is discarded instead, which is
 	// the wrong trade for a test whose whole point is arriving.
-	resp, err := client.Send(t.Context(), apns.Token(deviceToken), integrationNotification(), apns.Headers{
+	err := client.Send(t.Context(), apns.Token(deviceToken), integrationNotification(), apns.NotificationDetails{
+		ID:         testNotificationID,
 		PushType:   apns.PushTypeAlert,
 		Priority:   apns.PriorityImmediate,
 		CollapseID: "integration_test",
 	})
 	if err != nil {
-		t.Fatalf("the request did not complete: %s", err)
+		t.Fatalf("the request was not accepted: %s", err)
 	}
 
-	t.Logf("accepted as %s: %d %s", resp.ID, resp.Status, resp.Reason)
-
-	if !resp.IsOK() {
-		t.Errorf("unexpected status: %d %s", resp.Status, resp.Reason)
-	}
+	t.Logf("accepted as %s", testNotificationID)
 }
 
 // A key created for one environment is refused by the other. This is why the
@@ -218,15 +220,13 @@ func TestIntegrationSandboxKeyIsRefusedByProduction(t *testing.T) {
 
 	client := integrationClientFromKeyFile(t, apns.ProductionBaseURL, keyPath, keyID, teamID, integrationBundleID(t))
 
-	resp, err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.Headers{
+	var resp *apns.ErrResponse
+	err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.NotificationDetails{
+		ID:       testNotificationID,
 		PushType: apns.PushTypeAlert,
 	})
-	if err != nil {
-		t.Fatalf("the request did not complete: %s", err)
-	}
-
-	if resp.IsOK() {
-		t.Fatal("production accepted a sandbox key")
+	if !errors.As(err, &resp) {
+		t.Fatalf("expected a rejection: %s", err)
 	}
 
 	// Worth recording what Apple actually says here, because it decides whether an
@@ -264,16 +264,15 @@ func TestIntegrationUnregisteredKeyIsRejected(t *testing.T) {
 
 	client := integrationClientFromKeyFile(t, apns.SandboxBaseURL, keyPath, keyID, teamID, integrationBundleID(t))
 
-	resp, err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.Headers{
+	var resp *apns.ErrResponse
+	err := client.Send(t.Context(), unknownToken(), integrationNotification(), apns.NotificationDetails{
+		ID:       testNotificationID,
 		PushType: apns.PushTypeAlert,
 	})
-	if err != nil {
-		t.Fatalf("the request did not complete: %s", err)
+	if !errors.As(err, &resp) {
+		t.Fatalf("expected a rejection: %s", err)
 	}
 
-	if resp.IsOK() {
-		t.Fatal("APNs accepted a key it does not know")
-	}
 	if resp.Reason != apns.ReasonInvalidProviderToken {
 		t.Errorf("unexpected reason: %s %d", resp.Reason, resp.Status)
 	}
