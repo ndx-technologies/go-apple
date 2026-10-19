@@ -162,6 +162,16 @@ func (s AppleAppStoreClient) GetTransactionInfo(ctx context.Context, transaction
 
 // SendConsumptionInformation sends consumption information about an In-App Purchase to the App Store.
 // https://developer.apple.com/documentation/appstoreserverapi/send-consumption-information
+//
+// Unofficial Observation:
+// Responding to consumpiton request and getting 202 does not guarantee that CONSUMPTION_REQUEST will not be requested by Apple again for that transaction.
+// Apple may send several CONSUMPTION_REQUEST notifications for the same transaction while a refund request is open, even after replying to them.
+// Observed in production: up to 3 notifications about 8 hours apart, followed by a REFUND a few hours after the last one.
+// Each carries a new notificationUUID, which distinguishes them from redeliveries: when Apple retries delivery of a notification it reuses the same notificationUUID.
+// Apple does not document this repetition, and it is not a signal that an earlier call was rejected;
+// the same behaviour has been reported against the v1 endpoint as well (https://developer.apple.com/forums/thread/745077).
+// Respond with the freshest data each time rather than deduplicating by transaction ID.
+// https://github.com/argus-sight/refund-swatter-lite handles every CONSUMPTION_REQUEST notification as its own consumption request and replies to each, including repeated ones.
 func (s AppleAppStoreClient) SendConsumptionInformation(ctx context.Context, transactionID TransactionID, req ConsumptionRequest) (err error) {
 	ctx, span := otel.Tracer("appstore").Start(ctx, "SendConsumptionInformation", trace.WithSpanKind(trace.SpanKindClient))
 	defer span.End()
