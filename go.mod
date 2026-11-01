@@ -11,7 +11,7 @@ require (
 	github.com/ndx-technologies/ocspx v0.1.3
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 )
 
 require (
