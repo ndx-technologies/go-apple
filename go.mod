@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/MicahParks/jwkset v0.11.3
-	github.com/fxamacker/cbor/v2 v2.9.4
+	github.com/fxamacker/cbor/v2 v2.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/ndx-technologies/jws v0.1.3
